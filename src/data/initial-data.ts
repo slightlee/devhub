@@ -1,0 +1,47 @@
+// 前端初始工具占位数据：在后端状态回填前用于渲染默认列表。
+import type { Tool } from "../types/models";
+
+export const initialTools: Tool[] = [
+  {
+    id: "claude",
+    name: "Claude CLI",
+    vendor: "Anthropic",
+    vendorIcon: "/assets/anthropic.svg",
+    status: "not_installed",
+    currentVersion: "--",
+    latestVersion: "--",
+    path: "--",
+    configPath: "--",
+    pathNeedsSetup: false,
+    shellConfigFile: "--",
+    progress: 0,
+  },
+  {
+    id: "gemini",
+    name: "Gemini CLI",
+    vendor: "Google",
+    vendorIcon: "/assets/google.svg",
+    status: "not_installed",
+    currentVersion: "--",
+    latestVersion: "--",
+    path: "--",
+    configPath: "--",
+    pathNeedsSetup: false,
+    shellConfigFile: "--",
+    progress: 0,
+  },
+  {
+    id: "codex",
+    name: "Codex CLI",
+    vendor: "OpenAI",
+    vendorIcon: "/assets/openai.svg",
+    status: "not_installed",
+    currentVersion: "--",
+    latestVersion: "--",
+    path: "--",
+    configPath: "--",
+    pathNeedsSetup: false,
+    shellConfigFile: "--",
+    progress: 0,
+  },
+];
