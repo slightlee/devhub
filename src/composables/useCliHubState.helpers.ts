@@ -28,6 +28,28 @@ export const detectOS = () => {
   return "Unknown";
 };
 
+const normalizeWindowsVersionLabel = (label: string, versionValue: string) => {
+  if (label !== "Windows") {
+    return versionValue ? `${label} ${versionValue}` : label;
+  }
+
+  const majorMinor = versionValue.match(/^(\d+)\.(\d+)/);
+  if (!majorMinor) {
+    return versionValue ? `${label} ${versionValue}` : label;
+  }
+
+  const major = Number(majorMinor[1]);
+  const minor = Number(majorMinor[2]);
+  const buildMatch = versionValue.match(/^\d+\.\d+\.(\d+)/);
+  const build = buildMatch ? Number(buildMatch[1]) : NaN;
+
+  if (major === 10 && minor === 0 && Number.isFinite(build) && build >= 22000) {
+    return `Windows 11 (${versionValue})`;
+  }
+
+  return versionValue ? `${label} ${versionValue}` : label;
+};
+
 export const resolveOsName = () => {
   try {
     const typeValue = osType();
@@ -37,7 +59,12 @@ export const resolveOsName = () => {
     else if (typeValue === "windows") label = "Windows";
     else if (typeValue === "linux") label = "Linux";
     else if (typeValue) label = typeValue;
-    return versionValue ? `${label} ${versionValue}` : label;
+
+    if (!versionValue) {
+      return label;
+    }
+
+    return normalizeWindowsVersionLabel(label, versionValue);
   } catch {
     return detectOS();
   }

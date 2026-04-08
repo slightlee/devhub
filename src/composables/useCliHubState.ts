@@ -7,7 +7,7 @@ import { useSettingsState } from "./useSettingsState";
 import { useTaskProgress } from "./useTaskProgress";
 import { useToolActions } from "./useToolActions";
 
-export { isModuleKey, logStatusChannel, shouldSurfaceLogStatus } from "./useCliHubState.helpers";
+export { isModuleKey, logStatusChannel, resolveOsName, shouldSurfaceLogStatus } from "./useCliHubState.helpers";
 
 export const useCliHubState = () => {
   const unlistenFns: Array<() => void> = [];
