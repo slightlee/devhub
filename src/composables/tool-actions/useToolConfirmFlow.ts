@@ -27,6 +27,11 @@ export const useToolConfirmFlow = ({ addLog, checkSources, tools }: Params) => {
     return tools.value.find((tool) => tool.id === pendingAction.value?.toolId)?.name || "";
   });
 
+  const getTool = (toolId?: string) => {
+    if (!toolId) return null;
+    return tools.value.find((tool) => tool.id === toolId) || null;
+  };
+
   const vendorIconForConfirm = computed(() => {
     if (!pendingAction.value || pendingAction.value.action === "batch_update") return "";
     return tools.value.find((tool) => tool.id === pendingAction.value?.toolId)?.vendorIcon || "";
@@ -55,8 +60,9 @@ export const useToolConfirmFlow = ({ addLog, checkSources, tools }: Params) => {
       return hasCommandPreview ? "将执行 claude update 以调用官方更新通道。" : fallbackHint;
     }
     if (toolId === "claude" && pendingAction.value.action === "fix_path") {
-      const tool = tools.value.find((item) => item.id === toolId);
-      const configFile = tool?.shellConfigFile || "~/.zshrc";
+      const tool = getTool(toolId);
+      if (!tool?.supportsPathFix) return "当前平台不支持 PATH 自动写入，请手动配置 PATH。";
+      const configFile = tool.shellConfigFile || "--";
       return `将写入 ${configFile}（含 # devhub 标记），完成后请在终端执行 source \"${configFile}\" 或重启终端。`;
     }
     if (pendingAction.value.action === "uninstall") {
@@ -99,20 +105,24 @@ export const useToolConfirmFlow = ({ addLog, checkSources, tools }: Params) => {
       void checkSources(action, toolId);
     }
     if (toolId === "claude" && action === "install") {
-      const tool = tools.value.find((item) => item.id === toolId);
-      const configFile = tool?.shellConfigFile || "~/.zshrc";
-      optionVisible.value = true;
-      optionChecked.value = true;
-      optionLabel.value = "安装完成后写入 PATH（推荐）";
-      optionHint.value = `将写入 ${configFile}（含 # devhub 标记），便于终端直接使用 claude。`;
+      const tool = getTool(toolId);
+      if (tool?.supportsPathFix) {
+        const configFile = tool.shellConfigFile || "--";
+        optionVisible.value = true;
+        optionChecked.value = true;
+        optionLabel.value = "安装完成后写入 PATH（推荐）";
+        optionHint.value = `将写入 ${configFile}（含 # devhub 标记），便于终端直接使用 claude。`;
+      }
     }
     if (toolId === "claude" && action === "uninstall") {
-      const tool = tools.value.find((item) => item.id === toolId);
-      const configFile = tool?.shellConfigFile || "~/.zshrc";
-      optionVisible.value = true;
-      optionChecked.value = false;
-      optionLabel.value = "同时清理 PATH（仅移除 DevHub 标记行）";
-      optionHint.value = `仅清理 ${configFile} 中包含 # devhub 的行。`;
+      const tool = getTool(toolId);
+      if (tool?.supportsPathFix) {
+        const configFile = tool.shellConfigFile || "--";
+        optionVisible.value = true;
+        optionChecked.value = false;
+        optionLabel.value = "同时清理 PATH（仅移除 DevHub 标记行）";
+        optionHint.value = `仅清理 ${configFile} 中包含 # devhub 的行。`;
+      }
     }
   };
 

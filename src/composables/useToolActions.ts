@@ -59,6 +59,7 @@ export const useToolActions = (addLog: AddLog, onActionFailure: OnActionFailure)
     optionChecked,
     pendingAction,
     resetConfirmState,
+    tools,
   });
 
   const { subscribeToolEvents } = useToolEventSubscriptions({

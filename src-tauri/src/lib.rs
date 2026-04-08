@@ -28,6 +28,7 @@ struct ToolState {
     path: String,
     config_path: String,
     path_needs_setup: bool,
+    supports_path_fix: bool,
     shell_config_file: String,
     progress: u8,
     active_action: Option<String>,
@@ -129,6 +130,18 @@ struct ToolSpec {
     uninstall_cmd: &'static str,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlatformKind {
+    Windows,
+    Unix,
+}
+
+#[derive(Clone, Copy)]
+struct PlatformCapabilities {
+    supports_path_fix: bool,
+    preferred_shell: &'static str,
+}
+
 #[derive(Clone)]
 struct ToolRollback {
     status: String,
@@ -137,6 +150,7 @@ struct ToolRollback {
     path: String,
     config_path: String,
     path_needs_setup: bool,
+    supports_path_fix: bool,
     shell_config_file: String,
 }
 
@@ -202,7 +216,8 @@ impl AppState {
 }
 
 fn initial_tools() -> Vec<ToolState> {
-    let shell_config_file = shell_config_path_string();
+    let platform = current_platform();
+    let shell_config_file = shell_config_path_string(platform);
     TOOL_SPECS
         .iter()
         .map(|tool| ToolState {
@@ -216,6 +231,7 @@ fn initial_tools() -> Vec<ToolState> {
             path: "--".into(),
             config_path: config_path_for(tool),
             path_needs_setup: false,
+            supports_path_fix: supports_path_fix(tool.id, platform),
             shell_config_file: shell_config_file.clone(),
             progress: 0,
             active_action: None,
@@ -335,8 +351,8 @@ async fn save_settings_to_disk(settings: &SettingsState) -> Result<(), String> {
     Ok(())
 }
 
-fn shell_config_path() -> Option<PathBuf> {
-    if cfg!(target_os = "windows") {
+fn shell_config_path(platform: PlatformKind) -> Option<PathBuf> {
+    if platform == PlatformKind::Windows {
         return None;
     }
     let home = resolve_home_dir()?;
@@ -355,8 +371,8 @@ fn shell_config_path() -> Option<PathBuf> {
     Some(home.join(".bashrc"))
 }
 
-fn shell_config_path_string() -> String {
-    shell_config_path()
+fn shell_config_path_string(platform: PlatformKind) -> String {
+    shell_config_path(platform)
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| "--".to_string())
 }
@@ -383,12 +399,10 @@ fn status_for_action(action: &str) -> Option<&'static str> {
     }
 }
 
-fn command_for_action(tool_id: &str, action: &str) -> Option<&'static str> {
-    let tool = tool_spec(tool_id)?;
+fn command_for_action(tool_id: &str, action: &str, platform: PlatformKind) -> Option<String> {
+    tool_spec(tool_id)?;
     match action {
-        "install" => Some(tool.install_cmd),
-        "update" => Some(tool.update_cmd),
-        "uninstall" => Some(tool.uninstall_cmd),
+        "install" | "update" | "uninstall" => Some(resolve_action_command(tool_id, action, platform)),
         _ => None,
     }
 }
@@ -402,14 +416,83 @@ fn action_label(action: &str) -> &'static str {
     }
 }
 
+fn current_platform() -> PlatformKind {
+    if cfg!(target_os = "windows") {
+        PlatformKind::Windows
+    } else {
+        PlatformKind::Unix
+    }
+}
+
+fn platform_capabilities(platform: PlatformKind) -> PlatformCapabilities {
+    match platform {
+        PlatformKind::Windows => PlatformCapabilities {
+            supports_path_fix: false,
+            preferred_shell: "cmd.exe",
+        },
+        PlatformKind::Unix => PlatformCapabilities {
+            supports_path_fix: true,
+            preferred_shell: if Path::new("/bin/zsh").exists() {
+                "/bin/zsh"
+            } else {
+                "/bin/bash"
+            },
+        },
+    }
+}
+
+fn supports_path_fix(tool_id: &str, platform: PlatformKind) -> bool {
+    tool_id == "claude" && platform_capabilities(platform).supports_path_fix
+}
+
+fn resolve_action_command(tool_id: &str, action: &str, platform: PlatformKind) -> String {
+    if tool_id == "claude" {
+        return match (platform, action) {
+            (PlatformKind::Windows, "install") => {
+                "powershell -NoProfile -Command \"iwr https://claude.ai/install.ps1 -UseBasicParsing | iex\"".to_string()
+            }
+            (PlatformKind::Windows, "uninstall") => {
+                "npm uninstall -g @anthropic-ai/claude-code".to_string()
+            }
+            (_, "install") => "curl -fsSL https://claude.ai/install.sh | bash".to_string(),
+            (_, "update") => "claude update".to_string(),
+            (_, "uninstall") => {
+                "rm -f \"$HOME/.local/bin/claude\" && rm -rf \"$HOME/.local/share/claude\"".to_string()
+            }
+            _ => String::new(),
+        };
+    }
+
+    if let Some(spec) = tool_spec(tool_id) {
+        return match action {
+            "install" => spec.install_cmd.to_string(),
+            "update" => spec.update_cmd.to_string(),
+            "uninstall" => spec.uninstall_cmd.to_string(),
+            _ => String::new(),
+        };
+    }
+
+    String::new()
+}
+
 fn build_action_commands_map() -> BTreeMap<String, BTreeMap<String, String>> {
+    let platform = current_platform();
     let mut map = BTreeMap::new();
     for spec in TOOL_SPECS {
         let mut commands = BTreeMap::new();
-        commands.insert("install".to_string(), spec.install_cmd.to_string());
-        commands.insert("update".to_string(), spec.update_cmd.to_string());
-        commands.insert("uninstall".to_string(), spec.uninstall_cmd.to_string());
-        if spec.id == "claude" {
+        commands.insert(
+            "install".to_string(),
+            resolve_action_command(spec.id, "install", platform),
+        );
+        commands.insert(
+            "update".to_string(),
+            resolve_action_command(spec.id, "update", platform),
+        );
+        commands.insert(
+            "uninstall".to_string(),
+            resolve_action_command(spec.id, "uninstall", platform),
+        );
+        if supports_path_fix(spec.id, platform) {
             commands.insert(
                 "fix_path".to_string(),
                 format!("{}\n{}", PATH_MARKER, PATH_EXPORT_LINE),
@@ -421,14 +504,7 @@ fn build_action_commands_map() -> BTreeMap<String, BTreeMap<String, String>> {
 }
 
 fn preferred_shell() -> &'static str {
-    if cfg!(target_os = "windows") {
-        return "cmd.exe";
-    }
-    if Path::new("/bin/zsh").exists() {
-        "/bin/zsh"
-    } else {
-        "/bin/bash"
-    }
+    platform_capabilities(current_platform()).preferred_shell
 }
 
 fn is_windows_shell(shell: &str) -> bool {
@@ -700,8 +776,12 @@ async fn check_npm_package(shell: &str, envs: &[(String, String)], package: &str
     }
 }
 
-async fn check_claude_script(shell: &str, envs: &[(String, String)]) -> String {
-    let command = "curl -fsSL --max-time 8 https://claude.ai/install.sh";
+async fn check_claude_script(shell: &str, envs: &[(String, String)], platform: PlatformKind) -> String {
+    let command = if platform == PlatformKind::Windows {
+        "powershell -NoProfile -Command \"(iwr https://claude.ai/install.ps1 -UseBasicParsing -TimeoutSec 8).Content\""
+    } else {
+        "curl -fsSL --max-time 8 https://claude.ai/install.sh"
+    };
     match read_command_output_with_env(shell, command, envs).await {
         Ok(output) => {
             let trimmed = output.trim_start();
@@ -712,7 +792,11 @@ async fn check_claude_script(shell: &str, envs: &[(String, String)]) -> String {
             if lower.starts_with("<!doctype html") || lower.starts_with("<html") {
                 return "fail".to_string();
             }
-            if !trimmed.starts_with("#!") {
+            if platform == PlatformKind::Windows {
+                if !lower.contains("anthropic") && !lower.contains("claude") {
+                    return "fail".to_string();
+                }
+            } else if !trimmed.starts_with("#!") {
                 return "fail".to_string();
             }
             "ok".to_string()
@@ -761,6 +845,7 @@ async fn check_sources(
         }
     }
 
+    let platform = current_platform();
     let shell = preferred_shell();
     let envs = build_proxy_envs(&current_settings(&app));
     let npm = if npm_packages.is_empty() {
@@ -778,10 +863,15 @@ async fn check_sources(
     };
 
     let claude = if check_claude {
-        if resolve_command_path(shell, "curl").await.is_none() {
+        let fetch_ready = if platform == PlatformKind::Windows {
+            resolve_command_path(shell, "powershell").await.is_some()
+        } else {
+            resolve_command_path(shell, "curl").await.is_some()
+        };
+        if !fetch_ready {
             "fail".to_string()
         } else {
-            check_claude_script(shell, &envs).await
+            check_claude_script(shell, &envs, platform).await
         }
     } else {
         "unknown".to_string()
@@ -1026,9 +1116,11 @@ fn update_tool_progress(app: &AppHandle, tool_id: &str, progress: u8, status: &s
 async fn refresh_tool_state(app: &AppHandle, tool_id: &str, shell: &str) -> Option<ToolState> {
     let spec = tool_spec(tool_id)?;
     let bin = spec.bin;
+    let platform = current_platform();
     let config_path = config_path_for(spec);
-    let shell_config_file = shell_config_path_string();
+    let shell_config_file = shell_config_path_string(platform);
     let mut path_needs_setup = false;
+    let tool_supports_path_fix = supports_path_fix(tool_id, platform);
 
     let path = resolve_command_path(shell, bin).await;
     let (status, current_version, current_norm, path_value) = if let Some(path) = path {
@@ -1044,7 +1136,7 @@ async fn refresh_tool_state(app: &AppHandle, tool_id: &str, shell: &str) -> Opti
                     Some((version, parsed)) => (version, parsed),
                     None => ("--".to_string(), None),
                 };
-                path_needs_setup = !shell_config_has_local_bin(&shell_config_file).await;
+                path_needs_setup = tool_supports_path_fix && !shell_config_has_local_bin(&shell_config_file).await;
                 (
                     "installed".to_string(),
                     display,
@@ -1103,6 +1195,7 @@ async fn refresh_tool_state(app: &AppHandle, tool_id: &str, shell: &str) -> Opti
     tool.path = path_value;
     tool.config_path = config_path;
     tool.path_needs_setup = path_needs_setup;
+    tool.supports_path_fix = tool_supports_path_fix;
     tool.shell_config_file = shell_config_file;
     tool.progress = 0;
     tool.active_action = None;
@@ -1216,10 +1309,12 @@ async fn get_tools_state(app: AppHandle) -> Result<Vec<ToolState>, String> {
 
 #[tauri::command]
 async fn apply_path_fix(app: AppHandle, tool_id: String) -> Result<(), String> {
-    if tool_id != "claude" {
-        return Err("仅支持 Claude PATH 修复。".to_string());
+    let platform = current_platform();
+    if !supports_path_fix(&tool_id, platform) {
+        return Err("当前平台不支持 PATH 修复。".to_string());
     }
-    let config_path = shell_config_path().ok_or_else(|| "无法识别 shell 配置文件。".to_string())?;
+    let config_path =
+        shell_config_path(platform).ok_or_else(|| "无法识别 shell 配置文件。".to_string())?;
     let config_path_display = config_path.to_string_lossy().to_string();
     let content = fs::read_to_string(&config_path).await.unwrap_or_default();
     if content.lines().any(|line| line.contains(PATH_MARKER)) {
@@ -1272,10 +1367,12 @@ async fn apply_path_fix(app: AppHandle, tool_id: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn apply_path_cleanup(app: AppHandle, tool_id: String) -> Result<(), String> {
-    if tool_id != "claude" {
-        return Err("仅支持 Claude PATH 清理。".to_string());
+    let platform = current_platform();
+    if !supports_path_fix(&tool_id, platform) {
+        return Err("当前平台不支持 PATH 清理。".to_string());
     }
-    let config_path = shell_config_path().ok_or_else(|| "无法识别 shell 配置文件。".to_string())?;
+    let config_path =
+        shell_config_path(platform).ok_or_else(|| "无法识别 shell 配置文件。".to_string())?;
     let config_path_display = config_path.to_string_lossy().to_string();
 
     let content = match fs::read_to_string(&config_path).await {
@@ -1339,7 +1436,9 @@ fn start_action_inner(
     action: String,
 ) -> Result<(), String> {
     let status = status_for_action(&action).ok_or_else(|| "未知操作".to_string())?;
-    let _ = command_for_action(&tool_id, &action).ok_or_else(|| "未找到命令".to_string())?;
+    let platform = current_platform();
+    let _ = command_for_action(&tool_id, &action, platform)
+        .ok_or_else(|| "未找到命令".to_string())?;
 
     let (tool_snapshot, rollback) = {
         let mut inner = state.inner.lock().map_err(|_| "锁失败".to_string())?;
@@ -1363,6 +1462,7 @@ fn start_action_inner(
             path: tool.path.clone(),
             config_path: tool.config_path.clone(),
             path_needs_setup: tool.path_needs_setup,
+            supports_path_fix: tool.supports_path_fix,
             shell_config_file: tool.shell_config_file.clone(),
         };
 
@@ -1409,21 +1509,23 @@ async fn run_tool_action(
     action: String,
     rollback: ToolRollback,
 ) -> Result<(), String> {
+    let platform = current_platform();
     let shell = preferred_shell();
     let status = status_for_action(&action).ok_or_else(|| "未知操作".to_string())?;
-    let command = command_for_action(&tool_id, &action).ok_or_else(|| "未找到命令".to_string())?;
+    let command =
+        command_for_action(&tool_id, &action, platform).ok_or_else(|| "未找到命令".to_string())?;
     let proxy_envs = if matches!(action.as_str(), "install" | "update") {
         build_proxy_envs(&current_settings(&app))
     } else {
         Vec::new()
     };
 
-    if let Err(error) = check_action_dependencies(shell, &tool_id, &action).await {
+    if let Err(error) = check_action_dependencies(shell, &tool_id, &action, platform).await {
         rollback_tool_state(&app, &tool_id, rollback);
         return Err(error);
     }
 
-    if tool_id == "claude" && action == "install" {
+    if tool_id == "claude" && action == "install" && platform == PlatformKind::Unix {
         if let Err(error) = run_claude_install(&app, &tool_id, status, shell, &proxy_envs).await {
             rollback_tool_state(&app, &tool_id, rollback);
             return Err(format!("命令失败：{}", error));
@@ -1435,7 +1537,7 @@ async fn run_tool_action(
     emit_log(&app, &format!("执行命令：{}", command), "info");
 
     if let Err(error) =
-        run_command_streaming(&app, &tool_id, status, shell, command, &proxy_envs).await
+        run_command_streaming(&app, &tool_id, status, shell, &command, &proxy_envs).await
     {
         rollback_tool_state(&app, &tool_id, rollback);
         return Err(format!("命令失败：{}", error));
@@ -1445,11 +1547,20 @@ async fn run_tool_action(
     Ok(())
 }
 
-async fn check_action_dependencies(shell: &str, tool_id: &str, action: &str) -> Result<(), String> {
+async fn check_action_dependencies(
+    shell: &str,
+    tool_id: &str,
+    action: &str,
+    platform: PlatformKind,
+) -> Result<(), String> {
     if tool_id == "claude" {
         if action == "install" {
-            ensure_dependency(shell, "curl").await?;
-            ensure_dependency(shell, "bash").await?;
+            if platform == PlatformKind::Windows {
+                ensure_dependency(shell, "powershell").await?;
+            } else {
+                ensure_dependency(shell, "curl").await?;
+                ensure_dependency(shell, "bash").await?;
+            }
         } else if action == "update" {
             ensure_dependency(shell, "claude").await?;
         }
@@ -1599,6 +1710,7 @@ fn rollback_tool_state(app: &AppHandle, tool_id: &str, rollback: ToolRollback) {
         tool.path = rollback.path;
         tool.config_path = rollback.config_path;
         tool.path_needs_setup = rollback.path_needs_setup;
+        tool.supports_path_fix = rollback.supports_path_fix;
         tool.shell_config_file = rollback.shell_config_file;
         tool.progress = 0;
         tool.active_action = None;
@@ -1677,8 +1789,9 @@ fn batch_update(window: Window, state: State<AppState>) -> Result<BatchUpdateRes
 #[cfg(test)]
 mod tests {
     use super::{
-        action_label, build_action_commands_map, path_lookup_command, reconcile_latest_status,
-        stderr_log_level, wrap_shell_command, PATH_EXPORT_LINE, PATH_MARKER,
+        action_label, build_action_commands_map, current_platform, path_lookup_command,
+        reconcile_latest_status, resolve_action_command, stderr_log_level, supports_path_fix,
+        wrap_shell_command, PATH_EXPORT_LINE, PATH_MARKER,
     };
 
     #[test]
@@ -1689,17 +1802,22 @@ mod tests {
     }
 
     #[test]
-    fn build_action_commands_map_should_include_claude_fix_path() {
+    fn build_action_commands_map_should_include_claude_fix_path_on_supported_platform() {
         let commands = build_action_commands_map();
         let claude = commands
             .get("claude")
             .expect("expected claude action commands");
-        let fix_path = claude
-            .get("fix_path")
-            .expect("expected claude fix_path command");
 
-        assert!(fix_path.contains(PATH_MARKER));
-        assert!(fix_path.contains(PATH_EXPORT_LINE));
+        if supports_path_fix("claude", current_platform()) {
+            let fix_path = claude
+                .get("fix_path")
+                .expect("expected claude fix_path command");
+            assert!(fix_path.contains(PATH_MARKER));
+            assert!(fix_path.contains(PATH_EXPORT_LINE));
+        } else {
+            assert!(claude.get("fix_path").is_none());
+        }
+
         assert!(commands
             .get("codex")
             .and_then(|item| item.get("install"))
@@ -1718,6 +1836,23 @@ mod tests {
     fn path_lookup_command_should_switch_by_shell() {
         assert_eq!(path_lookup_command("/bin/zsh", "npm"), "command -v npm");
         assert_eq!(path_lookup_command("cmd.exe", "npm"), "where npm");
+    }
+
+    #[test]
+    fn resolve_action_command_should_switch_claude_install_by_platform() {
+        let unix_install = resolve_action_command("claude", "install", super::PlatformKind::Unix);
+        let windows_install =
+            resolve_action_command("claude", "install", super::PlatformKind::Windows);
+
+        assert!(unix_install.contains("install.sh"));
+        assert!(windows_install.contains("install.ps1"));
+    }
+
+    #[test]
+    fn resolve_action_command_should_use_npm_for_claude_windows_uninstall() {
+        let windows_uninstall =
+            resolve_action_command("claude", "uninstall", super::PlatformKind::Windows);
+        assert_eq!(windows_uninstall, "npm uninstall -g @anthropic-ai/claude-code");
     }
 
     #[test]

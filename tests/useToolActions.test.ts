@@ -37,6 +37,12 @@ describe("useToolActions", () => {
     });
     await state.loadActionCommands();
 
+    const claude = state.tools.value.find((tool) => tool.id === "claude");
+    if (claude) {
+      claude.supportsPathFix = true;
+      claude.shellConfigFile = "~/.zshrc";
+    }
+
     state.openConfirm("uninstall", "claude");
 
     expect(state.pendingAction.value).toEqual({ action: "uninstall", toolId: "claude" });
@@ -254,6 +260,39 @@ describe("useToolActions", () => {
     expect(addLog).not.toHaveBeenCalledWith(expect.stringContaining("批量更新已启动"), "warn");
   });
 
+  it("Claude 不支持 PATH 修复时不应展示卸载清理选项", async () => {
+    const addLog = vi.fn();
+    const onActionFailure = vi.fn();
+    const state = useToolActions(addLog, onActionFailure);
+    const claude = state.tools.value.find((tool) => tool.id === "claude");
+    if (claude) {
+      claude.supportsPathFix = false;
+      claude.shellConfigFile = "--";
+    }
+
+    state.openConfirm("uninstall", "claude");
+
+    expect(state.optionVisible.value).toBe(false);
+    expect(state.optionLabel.value).toBe("");
+    expect(state.optionHint.value).toBe("");
+  });
+
+  it("Claude 不支持 PATH 修复时 fix_path 应直接失败且不调用后端", async () => {
+    const addLog = vi.fn();
+    const onActionFailure = vi.fn();
+    const state = useToolActions(addLog, onActionFailure);
+    const claude = state.tools.value.find((tool) => tool.id === "claude");
+    if (claude) {
+      claude.supportsPathFix = false;
+    }
+
+    state.openConfirm("fix_path", "claude");
+    await state.confirmAction();
+
+    expect(onActionFailure).toHaveBeenCalledWith("当前平台不支持 PATH 自动写入。", undefined);
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "apply_path_fix")).toHaveLength(0);
+  });
+
   it("start_action 失败时应清理 PATH 后处理挂起状态", async () => {
     const handlers = new Map<string, (event: { payload: unknown }) => void>();
     listenMock.mockImplementation(async (eventName: string, handler: (event: { payload: unknown }) => void) => {
@@ -272,10 +311,15 @@ describe("useToolActions", () => {
     const state = useToolActions(addLog, onActionFailure);
     await state.subscribeToolEvents();
 
+    const claude = state.tools.value.find((tool) => tool.id === "claude");
+    if (claude) {
+      claude.supportsPathFix = true;
+      claude.shellConfigFile = "~/.zshrc";
+    }
+
     state.openConfirm("install", "claude");
     await state.confirmAction();
 
-    const claude = state.tools.value.find((tool) => tool.id === "claude");
     expect(claude).toBeTruthy();
 
     handlers.get("tool-progress")?.({

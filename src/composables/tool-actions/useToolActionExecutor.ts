@@ -3,7 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Ref } from "vue";
 import { toErrorMessage } from "./error-utils";
-import type { ActionType, PendingAction } from "../../types/models";
+import type { ActionType, PendingAction, Tool } from "../../types/models";
 import type { AddLog, BatchUpdateResult, OnActionFailure } from "./types";
 
 interface Params {
@@ -15,6 +15,7 @@ interface Params {
   optionChecked: Ref<boolean>;
   pendingAction: Ref<PendingAction | null>;
   resetConfirmState: () => void;
+  tools: Ref<Tool[]>;
 }
 
 export const useToolActionExecutor = ({
@@ -26,7 +27,13 @@ export const useToolActionExecutor = ({
   optionChecked,
   pendingAction,
   resetConfirmState,
+  tools,
 }: Params) => {
+  const getTool = (toolId?: string) => {
+    if (!toolId) return null;
+    return tools.value.find((tool) => tool.id === toolId) || null;
+  };
+
   const confirmAction = async () => {
     if (!pendingAction.value) return;
     const { action, toolId } = pendingAction.value;
@@ -48,12 +55,18 @@ export const useToolActionExecutor = ({
           onActionFailure(`批量更新启动失败：${detail}${suffix}`);
         }
       } else if (action === "fix_path" && toolId) {
-        await invoke("apply_path_fix", { toolId });
+        const tool = getTool(toolId);
+        if (!tool?.supportsPathFix) {
+          onActionFailure("当前平台不支持 PATH 自动写入。", undefined);
+        } else {
+          await invoke("apply_path_fix", { toolId });
+        }
       } else if (toolId) {
-        if (action === "install" && toolId === "claude" && optionChecked.value) {
+        const tool = getTool(toolId);
+        if (action === "install" && toolId === "claude" && optionChecked.value && tool?.supportsPathFix) {
           markPendingPathFix(toolId);
         }
-        if (action === "uninstall" && toolId === "claude" && optionChecked.value) {
+        if (action === "uninstall" && toolId === "claude" && optionChecked.value && tool?.supportsPathFix) {
           markPendingPathCleanup(toolId);
         }
         await invoke("start_action", { toolId, action: action as ActionType });
