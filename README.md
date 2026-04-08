@@ -30,6 +30,10 @@ DevHub 是一个跨平台桌面工具，用于统一管理开发环境中的 AI 
 - Rust stable toolchain
 - Tauri 2 运行依赖（按你的操作系统安装）
 
+### Windows 说明
+
+在 Windows 运行 `pnpm tauri dev` 前，请先满足系统依赖；常见报错与处理步骤见 `docs/FAQ.md`。
+
 ### 2) 安装依赖
 
 ```bash
@@ -58,7 +62,7 @@ pnpm tauri build --debug --no-bundle
 
 - 产品需求文档：`docs/PRD.md`
 - 版本规划：`docs/ROADMAP.md`
-- 文档索引：`docs/README.md`
+- 常见问题：`docs/FAQ.md`
 - 贡献指南：`CONTRIBUTING.md`
 
 ## 目录结构
