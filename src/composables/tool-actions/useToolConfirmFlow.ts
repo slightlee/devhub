@@ -14,6 +14,9 @@ interface Params {
 
 export const useToolConfirmFlow = ({ addLog, checkSources, tools }: Params) => {
   const actionCommands = ref<ActionCommandsMap>({});
+  const windowsPathTarget = "%USERPROFILE%\\.local\\bin";
+  const isWindowsPathFix = (tool: Tool | null) =>
+    Boolean(tool?.shellConfigFile?.startsWith("用户 PATH"));
 
   const pendingAction = ref<PendingAction | null>(null);
   const optionVisible = ref(false);
@@ -63,10 +66,19 @@ export const useToolConfirmFlow = ({ addLog, checkSources, tools }: Params) => {
       const tool = getTool(toolId);
       if (!tool?.supportsPathFix) return "当前平台不支持 PATH 自动写入，请手动配置 PATH。";
       const configFile = tool.shellConfigFile || "--";
+      if (isWindowsPathFix(tool)) {
+        return `将把 ${windowsPathTarget} 写入用户 PATH，完成后请重启终端或应用。`;
+      }
       return `将写入 ${configFile}（含 # devhub 标记），完成后请在终端执行 source \"${configFile}\" 或重启终端。`;
     }
     if (pendingAction.value.action === "uninstall") {
       if (toolId === "claude" && optionChecked.value) {
+        const tool = getTool(toolId);
+        if (isWindowsPathFix(tool)) {
+          return hasCommandPreview
+            ? `将同时从用户 PATH 移除 ${windowsPathTarget}。`
+            : `${fallbackHint} 将同时从用户 PATH 移除 ${windowsPathTarget}。`;
+        }
         return hasCommandPreview
           ? "将同时清理 PATH（仅移除 DevHub 标记行）。"
           : `${fallbackHint} 将同时清理 PATH（仅移除 DevHub 标记行）。`;
@@ -107,21 +119,31 @@ export const useToolConfirmFlow = ({ addLog, checkSources, tools }: Params) => {
     if (toolId === "claude" && action === "install") {
       const tool = getTool(toolId);
       if (tool?.supportsPathFix) {
-        const configFile = tool.shellConfigFile || "--";
         optionVisible.value = true;
         optionChecked.value = true;
-        optionLabel.value = "安装完成后写入 PATH（推荐）";
-        optionHint.value = `将写入 ${configFile}（含 # devhub 标记），便于终端直接使用 claude。`;
+        if (isWindowsPathFix(tool)) {
+          optionLabel.value = "安装完成后写入用户 PATH（推荐）";
+          optionHint.value = `将把 ${windowsPathTarget} 写入用户 PATH，便于终端直接使用 claude。`;
+        } else {
+          const configFile = tool.shellConfigFile || "--";
+          optionLabel.value = "安装完成后写入 PATH（推荐）";
+          optionHint.value = `将写入 ${configFile}（含 # devhub 标记），便于终端直接使用 claude。`;
+        }
       }
     }
     if (toolId === "claude" && action === "uninstall") {
       const tool = getTool(toolId);
       if (tool?.supportsPathFix) {
-        const configFile = tool.shellConfigFile || "--";
         optionVisible.value = true;
         optionChecked.value = false;
-        optionLabel.value = "同时清理 PATH（仅移除 DevHub 标记行）";
-        optionHint.value = `仅清理 ${configFile} 中包含 # devhub 的行。`;
+        if (isWindowsPathFix(tool)) {
+          optionLabel.value = "同时清理用户 PATH（推荐）";
+          optionHint.value = `将从用户 PATH 移除 ${windowsPathTarget}。`;
+        } else {
+          const configFile = tool.shellConfigFile || "--";
+          optionLabel.value = "同时清理 PATH（仅移除 DevHub 标记行）";
+          optionHint.value = `仅清理 ${configFile} 中包含 # devhub 的行。`;
+        }
       }
     }
   };

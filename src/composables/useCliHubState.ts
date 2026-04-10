@@ -56,7 +56,7 @@ export const useCliHubState = () => {
     toolNameForConfirm,
     tools,
     vendorIconForConfirm,
-  } = useToolActions(addLog, reportActionFailure);
+  } = useToolActions(addLog, reportActionFailure, settings);
 
   const { activeTasks, hasTasks, summary, taskChipLabel, taskMeta, toggleTask } = useTaskProgress(
     tools,

@@ -3,7 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Ref } from "vue";
 import { toErrorMessage } from "./error-utils";
-import type { ActionType, PendingAction, Tool } from "../../types/models";
+import type { ActionType, PendingAction, SettingsState, Tool } from "../../types/models";
 import type { AddLog, BatchUpdateResult, OnActionFailure } from "./types";
 
 interface Params {
@@ -15,6 +15,7 @@ interface Params {
   optionChecked: Ref<boolean>;
   pendingAction: Ref<PendingAction | null>;
   resetConfirmState: () => void;
+  settings?: Ref<SettingsState>;
   tools: Ref<Tool[]>;
 }
 
@@ -27,6 +28,7 @@ export const useToolActionExecutor = ({
   optionChecked,
   pendingAction,
   resetConfirmState,
+  settings,
   tools,
 }: Params) => {
   const getTool = (toolId?: string) => {
@@ -38,6 +40,15 @@ export const useToolActionExecutor = ({
     if (!pendingAction.value) return;
     const { action, toolId } = pendingAction.value;
     try {
+      if (["install", "update", "batch_update"].includes(action)) {
+        if (settings?.value) {
+          try {
+            await invoke("save_settings", { settings: settings.value });
+          } catch {
+            addLog("设置保存失败，可能导致代理未生效。", "warn");
+          }
+        }
+      }
       if (action === "batch_update") {
         const result = await invoke<BatchUpdateResult>("batch_update");
         const started = Array.isArray(result?.started) ? result.started : [];

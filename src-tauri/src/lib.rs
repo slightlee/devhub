@@ -11,9 +11,13 @@ use tauri::{AppHandle, Emitter, Manager, State, Window};
 use tauri_plugin_opener::OpenerExt;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::{Duration, Instant};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
+use encoding_rs::GB18030;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -166,6 +170,10 @@ struct InnerState {
 
 const PATH_MARKER: &str = "# devhub";
 const PATH_EXPORT_LINE: &str = "export PATH=\"$HOME/.local/bin:$PATH\"";
+const CLAUDE_INSTALL_PS1_URL: &str = "https://claude.ai/install.ps1";
+const CLAUDE_INSTALL_SH_URL: &str = "https://claude.ai/install.sh";
+const CLAUDE_INSTALL_SH_CMD: &str = "curl -fsSL https://claude.ai/install.sh | bash";
+const CLAUDE_INSTALL_PS1_COMMAND: &str = "powershell -Command \"irm https://claude.ai/install.ps1 | iex\"";
 
 const TOOL_SPECS: [ToolSpec; 3] = [
     ToolSpec {
@@ -175,7 +183,7 @@ const TOOL_SPECS: [ToolSpec; 3] = [
         vendor_icon: "/assets/anthropic.svg",
         bin: "claude",
         config_dir: ".claude",
-        install_cmd: "curl -fsSL https://claude.ai/install.sh | bash",
+        install_cmd: CLAUDE_INSTALL_SH_CMD,
         update_cmd: "claude update",
         uninstall_cmd: "rm -f \"$HOME/.local/bin/claude\" && rm -rf \"$HOME/.local/share/claude\"",
     },
@@ -372,6 +380,9 @@ fn shell_config_path(platform: PlatformKind) -> Option<PathBuf> {
 }
 
 fn shell_config_path_string(platform: PlatformKind) -> String {
+    if platform == PlatformKind::Windows {
+        return "用户 PATH（环境变量）".to_string();
+    }
     shell_config_path(platform)
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| "--".to_string())
@@ -416,6 +427,15 @@ fn action_label(action: &str) -> &'static str {
     }
 }
 
+fn action_label_from_status(status: &str) -> &'static str {
+    match status {
+        "installing" => "安装",
+        "updating" => "更新",
+        "uninstalling" => "卸载",
+        _ => "操作",
+    }
+}
+
 fn current_platform() -> PlatformKind {
     if cfg!(target_os = "windows") {
         PlatformKind::Windows
@@ -427,7 +447,7 @@ fn current_platform() -> PlatformKind {
 fn platform_capabilities(platform: PlatformKind) -> PlatformCapabilities {
     match platform {
         PlatformKind::Windows => PlatformCapabilities {
-            supports_path_fix: false,
+            supports_path_fix: true,
             preferred_shell: "cmd.exe",
         },
         PlatformKind::Unix => PlatformCapabilities {
@@ -449,12 +469,12 @@ fn resolve_action_command(tool_id: &str, action: &str, platform: PlatformKind) -
     if tool_id == "claude" {
         return match (platform, action) {
             (PlatformKind::Windows, "install") => {
-                "powershell -NoProfile -Command \"iwr https://claude.ai/install.ps1 -UseBasicParsing | iex\"".to_string()
+                CLAUDE_INSTALL_PS1_COMMAND.to_string()
             }
             (PlatformKind::Windows, "uninstall") => {
-                "npm uninstall -g @anthropic-ai/claude-code".to_string()
+                "powershell -Command \"Remove-Item -Path (Join-Path $env:USERPROFILE '.local\\bin\\claude.exe') -Force; Remove-Item -Path (Join-Path $env:USERPROFILE '.local\\share\\claude') -Recurse -Force\"".to_string()
             }
-            (_, "install") => "curl -fsSL https://claude.ai/install.sh | bash".to_string(),
+            (_, "install") => CLAUDE_INSTALL_SH_CMD.to_string(),
             (_, "update") => "claude update".to_string(),
             (_, "uninstall") => {
                 "rm -f \"$HOME/.local/bin/claude\" && rm -rf \"$HOME/.local/share/claude\"".to_string()
@@ -493,9 +513,14 @@ fn build_action_commands_map() -> BTreeMap<String, BTreeMap<String, String>> {
             resolve_action_command(spec.id, "uninstall", platform),
         );
         if supports_path_fix(spec.id, platform) {
+            let fix_path_preview = if platform == PlatformKind::Windows {
+                "更新用户 PATH：%USERPROFILE%\\.local\\bin".to_string()
+            } else {
+                format!("{}\n{}", PATH_MARKER, PATH_EXPORT_LINE)
+            };
             commands.insert(
                 "fix_path".to_string(),
-                format!("{}\n{}", PATH_MARKER, PATH_EXPORT_LINE),
+                fix_path_preview,
             );
         }
         map.insert(spec.id.to_string(), commands);
@@ -578,6 +603,372 @@ fn parse_version(raw: &str) -> (String, Option<String>) {
     }
 }
 
+async fn write_utf8_bom(path: &Path, content: &str) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(3 + content.len());
+    bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    bytes.extend_from_slice(content.as_bytes());
+    fs::write(path, bytes)
+        .await
+        .map_err(|error| format!("写入文件失败：{}", error))?;
+    Ok(())
+}
+
+fn parse_version_candidate(raw: &str, strict: bool) -> Option<(String, Option<String>)> {
+    let token = extract_version_token(raw)?;
+    if strict && !token.contains('.') {
+        return None;
+    }
+    Some((format_version_display(&token), Some(token)))
+}
+
+fn parse_version_from_text(text: &str, strict: bool) -> Option<(String, Option<String>)> {
+    for line in text.lines() {
+        let trimmed = strip_ansi(line).trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(parsed) = parse_version_candidate(&trimmed, strict) {
+            return Some(parsed);
+        }
+        if strict && trimmed.to_ascii_lowercase().contains("version") {
+            if let Some(parsed) = parse_version_candidate(&trimmed, false) {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+fn extract_json_payload(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    Some(text[start..=end].to_string())
+}
+
+fn decode_output(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+    if cfg!(target_os = "windows") {
+        let (cow, _, _) = GB18030.decode(bytes);
+        return cow.into_owned();
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn validate_claude_install_script(script: &str) -> Result<(), String> {
+    let trimmed = script.trim_start();
+    if trimmed.is_empty() {
+        return Err("未获取到官方安装脚本，请检查网络连接。".to_string());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("<!doctype html") || lower.starts_with("<html") {
+        if lower.contains("app unavailable in region") {
+            return Err("官方安装脚本不可用：当前网络/地区无法访问（App unavailable in region）。".to_string());
+        }
+        return Err("官方安装脚本异常：返回了 HTML 页面。请检查网络或代理。".to_string());
+    }
+    Ok(())
+}
+
+fn has_shell_shebang(script: &str) -> bool {
+    script.trim_start().starts_with("#!")
+}
+
+async fn fetch_claude_install_script_windows(
+    app: &AppHandle,
+    shell: &str,
+    envs: &[(String, String)],
+    powershell: Option<&PowerShellInfo>,
+    proxy: Option<&str>,
+    source_label: &str,
+) -> Result<String, String> {
+    let fetch_start = Instant::now();
+    emit_claude_script_fetch_start(app);
+
+    if resolve_command_path(shell, "curl").await.is_some() {
+        match read_command_output_with_env(
+            shell,
+            &format!("curl -fsSL --max-time 8 {}", CLAUDE_INSTALL_PS1_URL),
+            envs,
+        )
+        .await
+        {
+            Ok(output) => {
+                emit_claude_script_fetch_done(app, fetch_start.elapsed());
+                validate_claude_install_script(&output)?;
+                return Ok(output);
+            }
+            Err(error) => {
+                if powershell.is_none() {
+                    let message = format!("无法获取官方安装脚本：{}", error);
+                    emit_script_fetch_failed(app, "claude", &message);
+                    return Err(message);
+                }
+                emit_log(
+                    app,
+                    &format!("curl 获取安装脚本失败：{}，尝试 PowerShell 获取…", error),
+                    "warn",
+                );
+            }
+        }
+    }
+
+    let info = powershell.ok_or_else(|| "缺少依赖：curl 或 powershell".to_string())?;
+    if let Some(proxy_value) = proxy {
+        emit_log(
+            app,
+            &format!(
+                "PowerShell 将使用代理（来源：{}）：{}",
+                source_label,
+                redact_proxy_url(proxy_value)
+            ),
+            "info",
+        );
+    } else {
+        emit_log(
+            app,
+            "PowerShell 未检测到代理（DevHub 设置/环境变量），将直连访问。",
+            "warn",
+        );
+    }
+
+    let fetch_command = build_powershell_fetch_command(info, proxy);
+    let output = read_command_output_with_env(shell, &fetch_command, envs)
+        .await
+        .map_err(|error| {
+            let message = format!("无法获取官方安装脚本：{}", error);
+            emit_script_fetch_failed(app, "claude", &message);
+            message
+        })?;
+    emit_claude_script_fetch_done(app, fetch_start.elapsed());
+    validate_claude_install_script(&output)?;
+    Ok(output)
+}
+
+fn windows_local_bin_path() -> Option<PathBuf> {
+    resolve_home_dir().map(|home| home.join(".local").join("bin"))
+}
+
+fn normalize_windows_path_segment(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn windows_userprofile_local_bin_literal() -> String {
+    "%USERPROFILE%\\.local\\bin".to_string()
+}
+
+fn windows_path_contains(path_value: &str, target: &str) -> bool {
+    let normalized_target = normalize_windows_path_segment(target);
+    let normalized_env = normalize_windows_path_segment(&windows_userprofile_local_bin_literal());
+    path_value
+        .split(';')
+        .map(normalize_windows_path_segment)
+        .any(|segment| segment == normalized_target || segment == normalized_env)
+}
+
+async fn windows_local_bin_needs_path_setup(shell: &str) -> bool {
+    if let Some(target) = windows_local_bin_path() {
+        if let Some(user_path) = windows_user_path(shell).await {
+            return !windows_path_contains(&user_path, &target.to_string_lossy());
+        }
+        return true;
+    }
+    true
+}
+
+fn split_windows_path(value: &str) -> Vec<String> {
+    value
+        .split(';')
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string())
+        .collect()
+}
+
+fn escape_powershell_single_quotes(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn encode_powershell_command(command: &str) -> String {
+    let mut bytes: Vec<u8> = Vec::new();
+    for unit in command.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    BASE64_STANDARD.encode(bytes)
+}
+
+fn build_powershell_encoded_command(info: &PowerShellInfo, command: &str) -> String {
+    let encoded = encode_powershell_command(command);
+    format!(
+        "{} -NoProfile -NonInteractive -EncodedCommand {}",
+        quote_cmd_arg(&info.bin),
+        encoded
+    )
+}
+
+async fn windows_user_path(shell: &str) -> Option<String> {
+    let info = resolve_windows_powershell(shell).await?;
+    let command = build_powershell_encoded_command(
+        &info,
+        "[Environment]::GetEnvironmentVariable('Path','User')",
+    );
+    read_command_output(shell, &command).await.ok()
+}
+
+async fn set_windows_user_path(shell: &str, value: &str) -> Result<(), String> {
+    let info = resolve_windows_powershell(shell)
+        .await
+        .ok_or_else(|| "缺少依赖：powershell 或 pwsh".to_string())?;
+    let escaped = escape_powershell_single_quotes(value);
+    let command = build_powershell_encoded_command(
+        &info,
+        &format!(
+            "[Environment]::SetEnvironmentVariable('Path','{}','User')",
+            escaped
+        ),
+    );
+    read_command_output(shell, &command).await.map(|_| ())
+}
+
+fn proxy_url_from_envs(envs: &[(String, String)]) -> Option<String> {
+    for key in [
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Some((_, value)) = envs.iter().find(|(name, _)| name == key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn proxy_url_from_process_env() -> Option<String> {
+    for key in [
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn normalize_proxy_url(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.contains("://") {
+        return trimmed.to_string();
+    }
+    format!("http://{}", trimmed)
+}
+
+fn build_proxy_envs_from_url(url: &str) -> Vec<(String, String)> {
+    let normalized = normalize_proxy_url(url);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        ("http_proxy".to_string(), normalized.clone()),
+        ("https_proxy".to_string(), normalized.clone()),
+        ("all_proxy".to_string(), normalized.clone()),
+        ("HTTP_PROXY".to_string(), normalized.clone()),
+        ("HTTPS_PROXY".to_string(), normalized.clone()),
+        ("ALL_PROXY".to_string(), normalized.clone()),
+        ("npm_config_proxy".to_string(), normalized.clone()),
+        ("npm_config_https_proxy".to_string(), normalized),
+    ]
+}
+
+#[derive(Clone)]
+struct PowerShellInfo {
+    bin: String,
+}
+
+fn quote_cmd_arg(value: &str) -> String {
+    if value.contains(' ') || value.contains('"') {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn build_powershell_fetch_command(info: &PowerShellInfo, proxy_url: Option<&str>) -> String {
+    let command = if let Some(proxy) = proxy_url {
+        format!(
+            "{}; irm {} -TimeoutSec 8 -ErrorAction Stop",
+            build_powershell_proxy_prelude(proxy),
+            CLAUDE_INSTALL_PS1_URL
+        )
+    } else {
+        format!("irm {} -TimeoutSec 8 -ErrorAction Stop", CLAUDE_INSTALL_PS1_URL)
+    };
+    build_powershell_encoded_command(info, &command)
+}
+
+fn build_powershell_proxy_prelude(proxy: &str) -> String {
+    let escaped = escape_powershell_single_quotes(proxy);
+    format!(
+        "$proxy='{}'; $env:HTTP_PROXY=$proxy; $env:HTTPS_PROXY=$proxy; $env:ALL_PROXY=$proxy; \
+        try {{ $wp = New-Object System.Net.WebProxy($proxy, $true); \
+        [System.Net.WebRequest]::DefaultWebProxy = $wp; \
+        [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials; }} catch {{}}",
+        escaped
+    )
+}
+
+// Windows 安装走“macOS 同款”流程：下载脚本后本地执行（避免 cmd/pwsh 管道差异）
+
+fn windows_claude_uninstall_script() -> &'static str {
+    "Remove-Item -Path (Join-Path $env:USERPROFILE '.local\\bin\\claude.exe') -Force; Remove-Item -Path (Join-Path $env:USERPROFILE '.local\\share\\claude') -Recurse -Force"
+}
+
+fn build_windows_claude_uninstall_encoded_command(info: &PowerShellInfo) -> String {
+    build_powershell_encoded_command(info, windows_claude_uninstall_script())
+}
+
+async fn resolve_windows_powershell(shell: &str) -> Option<PowerShellInfo> {
+    if resolve_command_path(shell, "pwsh").await.is_some() {
+        return Some(PowerShellInfo {
+            bin: "pwsh".to_string(),
+        });
+    }
+    if resolve_command_path(shell, "powershell").await.is_some() {
+        return Some(PowerShellInfo {
+            bin: "powershell".to_string(),
+        });
+    }
+    None
+}
+
 async fn resolve_command_path(shell: &str, bin: &str) -> Option<String> {
     let lookup = path_lookup_command(shell, bin);
     let (flag, wrapped) = wrap_shell_command(shell, &lookup);
@@ -616,8 +1007,8 @@ async fn read_command_output_with_env(
         .output()
         .await
         .map_err(|error| format!("命令执行失败: {}", error))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = decode_output(&output.stdout).trim().to_string();
+    let stderr = decode_output(&output.stderr).trim().to_string();
     if !output.status.success() {
         let message = if !stderr.is_empty() {
             stderr
@@ -639,27 +1030,199 @@ async fn read_command_output(shell: &str, command: &str) -> Result<String, Strin
     read_command_output_with_env(shell, command, &[]).await
 }
 
-async fn get_tool_version(shell: &str, bin: &str) -> Option<(String, Option<String>)> {
-    let output = read_command_output(shell, &format!("{} --version", bin))
+async fn capture_command_output_with_env(
+    shell: &str,
+    command: &str,
+    envs: &[(String, String)],
+) -> Result<(String, String, bool), String> {
+    let (flag, wrapped) = wrap_shell_command(shell, command);
+    let output = Command::new(shell)
+        .arg(flag)
+        .arg(wrapped)
+        .envs(envs.iter().cloned())
+        .output()
         .await
-        .ok()?;
-    let line = output.lines().next().unwrap_or("").trim();
-    if line.is_empty() {
-        None
-    } else {
-        Some(parse_version(line))
+        .map_err(|error| format!("命令执行失败: {}", error))?;
+    let stdout = decode_output(&output.stdout).trim().to_string();
+    let stderr = decode_output(&output.stderr).trim().to_string();
+    Ok((stdout, stderr, output.status.success()))
+}
+
+async fn capture_command_output(
+    shell: &str,
+    command: &str,
+) -> Result<(String, String, bool), String> {
+    capture_command_output_with_env(shell, command, &[]).await
+}
+
+async fn capture_command_output_direct(
+    path: &Path,
+    args: &[&str],
+) -> Result<(String, String, bool), String> {
+    let output = Command::new(path)
+        .args(args)
+        .output()
+        .await
+        .map_err(|error| format!("命令执行失败: {}", error))?;
+    let stdout = decode_output(&output.stdout).trim().to_string();
+    let stderr = decode_output(&output.stderr).trim().to_string();
+    Ok((stdout, stderr, output.status.success()))
+}
+
+fn is_windows_script_path(path: &Path) -> bool {
+    if !cfg!(target_os = "windows") {
+        return false;
+    }
+    match path.extension().and_then(|value| value.to_str()) {
+        Some(ext) => matches!(ext.to_ascii_lowercase().as_str(), "cmd" | "bat"),
+        None => false,
     }
 }
 
 async fn get_tool_version_at_path(shell: &str, path: &Path) -> Option<(String, Option<String>)> {
+    if !is_windows_script_path(path) {
+        if let Ok((stdout, stderr, success)) =
+            capture_command_output_direct(path, &["--version"]).await
+        {
+            let strict = !success;
+            if let Some(parsed) = parse_version_from_text(&stdout, strict)
+                .or_else(|| parse_version_from_text(&stderr, strict))
+            {
+                return Some(parsed);
+            }
+        }
+    }
+
     let command = format!("\"{}\" --version", path.to_string_lossy());
-    let output = read_command_output(shell, &command).await.ok()?;
-    let line = output.lines().next().unwrap_or("").trim();
-    if line.is_empty() {
+    match capture_command_output(shell, &command).await {
+        Ok((stdout, stderr, success)) => {
+            let strict = !success;
+            parse_version_from_text(&stdout, strict).or_else(|| parse_version_from_text(&stderr, strict))
+        }
+        Err(error) => parse_version_from_text(&error, true),
+    }
+}
+
+async fn resolve_tool_version(shell: &str, tool_id: &str, path: &Path) -> (String, Option<String>) {
+    if let Some((display, norm)) = get_tool_version_at_path(shell, path).await {
+        return (display, norm);
+    }
+    if let Some(package) = npm_package_for(tool_id) {
+        if let Some((display, norm)) = get_npm_current_version(shell, package).await {
+            return (display, norm);
+        }
+    }
+    ("--".to_string(), None)
+}
+
+async fn npm_global_bin_path(shell: &str) -> Option<PathBuf> {
+    if resolve_command_path(shell, "npm").await.is_none() {
+        return None;
+    }
+    let output = read_command_output(shell, "npm bin -g").await.ok()?;
+    let trimmed = output.lines().next().unwrap_or("").trim();
+    if trimmed.is_empty() {
         None
     } else {
-        Some(parse_version(line))
+        Some(PathBuf::from(trimmed))
     }
+}
+
+async fn get_npm_current_version(shell: &str, package: &str) -> Option<(String, Option<String>)> {
+    if resolve_command_path(shell, "npm").await.is_none() {
+        return None;
+    }
+    let command = format!("npm list -g {} --depth=0 --json", package);
+    let (stdout, stderr, _) = capture_command_output(shell, &command).await.ok()?;
+    let combined = if stdout.is_empty() {
+        stderr.clone()
+    } else if stderr.is_empty() {
+        stdout.clone()
+    } else {
+        format!("{}\n{}", stdout, stderr)
+    };
+    let payload = extract_json_payload(&combined)?;
+    let value: serde_json::Value = serde_json::from_str(&payload).ok()?;
+    let version = value
+        .get("dependencies")?
+        .get(package)?
+        .get("version")?
+        .as_str()?;
+    parse_version_candidate(version, false)
+}
+
+fn windows_local_bin_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(home) = resolve_home_dir() {
+        candidates.push(home.join(".claude").join("bin").join("claude.cmd"));
+        candidates.push(home.join(".claude").join("bin").join("claude.exe"));
+        candidates.push(home.join(".claude").join("bin").join("claude"));
+        candidates.push(home.join(".local").join("bin").join("claude.cmd"));
+        candidates.push(home.join(".local").join("bin").join("claude.exe"));
+        candidates.push(home.join(".local").join("bin").join("claude"));
+    }
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let base = PathBuf::from(local_app_data);
+        candidates.push(base.join("Programs").join("Claude").join("claude.exe"));
+        candidates.push(base.join("Programs").join("Claude").join("bin").join("claude.exe"));
+        candidates.push(base.join("Claude").join("bin").join("claude.exe"));
+        candidates.push(base.join("claude").join("bin").join("claude.exe"));
+    }
+    if let Ok(program_files) = std::env::var("ProgramFiles") {
+        let base = PathBuf::from(program_files);
+        candidates.push(base.join("Claude").join("claude.exe"));
+        candidates.push(base.join("Claude").join("bin").join("claude.exe"));
+    }
+    candidates
+}
+
+async fn find_windows_claude_fallback(shell: &str) -> Option<PathBuf> {
+    if let Some(bin_dir) = npm_global_bin_path(shell).await {
+        let cmd_path = bin_dir.join("claude.cmd");
+        let exe_path = bin_dir.join("claude.exe");
+        if fs::metadata(&cmd_path).await.is_ok() {
+            return Some(cmd_path);
+        }
+        if fs::metadata(&exe_path).await.is_ok() {
+            return Some(exe_path);
+        }
+    }
+    for path in windows_local_bin_candidates() {
+        if fs::metadata(&path).await.is_ok() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+async fn windows_claude_detected(shell: &str) -> bool {
+    if resolve_command_path(shell, "claude").await.is_some() {
+        return true;
+    }
+    find_windows_claude_fallback(shell).await.is_some()
+}
+
+async fn claude_windows_debug_paths(shell: &str) -> Vec<String> {
+    let mut items: Vec<String> = Vec::new();
+    if let Some(bin_dir) = npm_global_bin_path(shell).await {
+        items.push(format!("npm bin -g: {}", bin_dir.to_string_lossy()));
+        for name in ["claude.cmd", "claude.exe", "claude"] {
+            let path = bin_dir.join(name);
+            let exists = fs::metadata(&path).await.is_ok();
+            let status = if exists { "存在" } else { "不存在" };
+            items.push(format!("check: {} ({})", path.to_string_lossy(), status));
+        }
+    } else {
+        items.push("npm bin -g: 未获取".to_string());
+    }
+
+    for path in windows_local_bin_candidates() {
+        let exists = fs::metadata(&path).await.is_ok();
+        let status = if exists { "存在" } else { "不存在" };
+        items.push(format!("check: {} ({})", path.to_string_lossy(), status));
+    }
+
+    items
 }
 
 async fn shell_config_has_local_bin(config_path: &str) -> bool {
@@ -730,23 +1293,82 @@ fn current_settings(app: &AppHandle) -> SettingsState {
         .unwrap_or_default()
 }
 
-fn build_proxy_envs(settings: &SettingsState) -> Vec<(String, String)> {
-    if !settings.proxy_enabled || settings.proxy_url.trim().is_empty() {
-        return Vec::new();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProxySource {
+    Settings,
+    Environment,
+    None,
+}
+
+struct ProxyContext {
+    envs: Vec<(String, String)>,
+    url: Option<String>,
+    source: ProxySource,
+}
+
+impl ProxyContext {
+    fn none() -> Self {
+        Self {
+            envs: Vec::new(),
+            url: None,
+            source: ProxySource::None,
+        }
     }
-    let url = settings.proxy_url.trim().to_string();
-    vec![
-        ("HTTP_PROXY".to_string(), url.clone()),
-        ("HTTPS_PROXY".to_string(), url.clone()),
-        ("ALL_PROXY".to_string(), url.clone()),
-        ("http_proxy".to_string(), url.clone()),
-        ("https_proxy".to_string(), url.clone()),
-        ("all_proxy".to_string(), url.clone()),
-        ("NPM_CONFIG_PROXY".to_string(), url.clone()),
-        ("NPM_CONFIG_HTTPS_PROXY".to_string(), url.clone()),
-        ("npm_config_proxy".to_string(), url.clone()),
-        ("npm_config_https_proxy".to_string(), url),
-    ]
+}
+
+fn proxy_source_label(source: ProxySource) -> &'static str {
+    match source {
+        ProxySource::Settings => "DevHub 设置",
+        ProxySource::Environment => "环境变量",
+        ProxySource::None => "未检测到",
+    }
+}
+
+fn redact_proxy_url(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Some(scheme_pos) = trimmed.find("://") {
+        let after_scheme = &trimmed[scheme_pos + 3..];
+        if let Some(at_pos) = after_scheme.find('@') {
+            let prefix = &trimmed[..scheme_pos + 3];
+            let host = &after_scheme[at_pos + 1..];
+            return format!("{}***@{}", prefix, host);
+        }
+    }
+    trimmed.to_string()
+}
+
+fn proxy_settings_snapshot(settings: &SettingsState) -> String {
+    let url = settings.proxy_url.trim();
+    let display = if url.is_empty() {
+        "<empty>".to_string()
+    } else {
+        redact_proxy_url(url)
+    };
+    format!("enabled={} url={}", settings.proxy_enabled, display)
+}
+
+fn resolve_proxy_context(settings: &SettingsState) -> ProxyContext {
+    if settings.proxy_enabled && !settings.proxy_url.trim().is_empty() {
+        let normalized = normalize_proxy_url(&settings.proxy_url);
+        return ProxyContext {
+            envs: build_proxy_envs_from_url(&normalized),
+            url: Some(normalized),
+            source: ProxySource::Settings,
+        };
+    }
+
+    if let Some(proxy) = proxy_url_from_process_env() {
+        let normalized = normalize_proxy_url(&proxy);
+        if !normalized.is_empty() {
+            return ProxyContext {
+                envs: build_proxy_envs_from_url(&normalized),
+                url: Some(normalized),
+                source: ProxySource::Environment,
+            };
+        }
+    }
+
+    ProxyContext::none()
 }
 
 fn with_npm_timeout_envs(envs: &[(String, String)]) -> Vec<(String, String)> {
@@ -776,27 +1398,36 @@ async fn check_npm_package(shell: &str, envs: &[(String, String)], package: &str
     }
 }
 
-async fn check_claude_script(shell: &str, envs: &[(String, String)], platform: PlatformKind) -> String {
+async fn check_claude_script(
+    app: &AppHandle,
+    shell: &str,
+    envs: &[(String, String)],
+    platform: PlatformKind,
+    powershell: Option<&PowerShellInfo>,
+) -> String {
     let command = if platform == PlatformKind::Windows {
-        "powershell -NoProfile -Command \"(iwr https://claude.ai/install.ps1 -UseBasicParsing -TimeoutSec 8).Content\""
+        let Some(info) = powershell else {
+            return "fail".to_string();
+        };
+        let proxy = proxy_url_from_envs(envs);
+        if let Some(proxy_value) = proxy.as_deref() {
+            emit_log(
+                app,
+                &format!("Claude PowerShell fetch 使用代理：{}", redact_proxy_url(proxy_value)),
+                "info",
+            );
+        }
+        build_powershell_fetch_command(info, proxy.as_deref())
     } else {
-        "curl -fsSL --max-time 8 https://claude.ai/install.sh"
+        format!("curl -fsSL --max-time 8 {}", CLAUDE_INSTALL_SH_URL)
     };
-    match read_command_output_with_env(shell, command, envs).await {
+    match read_command_output_with_env(shell, &command, envs).await {
         Ok(output) => {
             let trimmed = output.trim_start();
-            if trimmed.is_empty() {
+            if validate_claude_install_script(trimmed).is_err() {
                 return "fail".to_string();
             }
-            let lower = trimmed.to_ascii_lowercase();
-            if lower.starts_with("<!doctype html") || lower.starts_with("<html") {
-                return "fail".to_string();
-            }
-            if platform == PlatformKind::Windows {
-                if !lower.contains("anthropic") && !lower.contains("claude") {
-                    return "fail".to_string();
-                }
-            } else if !trimmed.starts_with("#!") {
+            if platform != PlatformKind::Windows && !has_shell_shebang(trimmed) {
                 return "fail".to_string();
             }
             "ok".to_string()
@@ -847,7 +1478,18 @@ async fn check_sources(
 
     let platform = current_platform();
     let shell = preferred_shell();
-    let envs = build_proxy_envs(&current_settings(&app));
+    let proxy_context = resolve_proxy_context(&current_settings(&app));
+    let envs = proxy_context.envs;
+    let powershell_info = if platform == PlatformKind::Windows && check_claude {
+        resolve_windows_powershell(shell).await
+    } else {
+        None
+    };
+    let has_curl = if check_claude {
+        resolve_command_path(shell, "curl").await.is_some()
+    } else {
+        false
+    };
     let npm = if npm_packages.is_empty() {
         "unknown".to_string()
     } else {
@@ -864,14 +1506,15 @@ async fn check_sources(
 
     let claude = if check_claude {
         let fetch_ready = if platform == PlatformKind::Windows {
-            resolve_command_path(shell, "powershell").await.is_some()
+            powershell_info.is_some()
         } else {
-            resolve_command_path(shell, "curl").await.is_some()
+            has_curl
         };
         if !fetch_ready {
             "fail".to_string()
         } else {
-            check_claude_script(shell, &envs, platform).await
+            check_claude_script(&app, shell, &envs, platform, powershell_info.as_ref())
+                .await
         }
     } else {
         "unknown".to_string()
@@ -931,6 +1574,27 @@ fn emit_log(app: &AppHandle, message: &str, status: &str) {
     persist_log(app, timestamp, message, status);
 }
 
+fn emit_command_log_with_action(app: &AppHandle, tool_id: &str, status: &str, command: &str) {
+    emit_log(
+        app,
+        &format!(
+            "执行命令（{} {}）：{}",
+            tool_name_for_log(tool_id),
+            action_label_from_status(status),
+            command
+        ),
+        "info",
+    );
+}
+
+fn emit_script_fetch_failed(app: &AppHandle, tool_id: &str, error: &str) {
+    emit_log(
+        app,
+        &format!("{} 安装脚本获取失败：{}", tool_name_for_log(tool_id), error),
+        "error",
+    );
+}
+
 fn emit_action_result(app: &AppHandle, tool_id: &str, action: &str, success: bool, message: &str) {
     let _ = app.emit(
         "tool-action-result",
@@ -941,6 +1605,91 @@ fn emit_action_result(app: &AppHandle, tool_id: &str, action: &str, success: boo
             success,
             message: message.to_string(),
         },
+    );
+}
+
+fn emit_tool_install_attempt(
+    app: &AppHandle,
+    tool_id: &str,
+    channel: &str,
+    detail: Option<&str>,
+) {
+    let suffix = detail.unwrap_or("");
+    emit_log(
+        app,
+        &format!("尝试使用 {} 安装 {}{}…", channel, tool_name_for_log(tool_id), suffix),
+        "info",
+    );
+}
+
+fn emit_tool_uninstall_attempt(
+    app: &AppHandle,
+    tool_id: &str,
+    channel: &str,
+    detail: Option<&str>,
+) {
+    let suffix = detail.unwrap_or("");
+    emit_log(
+        app,
+        &format!("尝试使用 {} 卸载 {}{}…", channel, tool_name_for_log(tool_id), suffix),
+        "info",
+    );
+}
+
+fn emit_windows_path_read_failed(app: &AppHandle, context: &str, level: &str) {
+    emit_log(app, &format!("读取用户 PATH 失败，{}。", context), level);
+}
+
+fn emit_path_cleanup_noop(app: &AppHandle, scope: &str) {
+    let trimmed = scope.trim();
+    if trimmed.is_empty() {
+        emit_log(app, "未检测到 DevHub 写入的 PATH 记录，无需清理。", "info");
+    } else {
+        emit_log(
+            app,
+            &format!("未检测到 DevHub 写入的 {} PATH 记录，无需清理。", trimmed),
+            "info",
+        );
+    }
+}
+
+fn emit_batch_update_empty(app: &AppHandle) {
+    emit_log(app, "暂无可更新的工具", "warn");
+}
+
+fn emit_update_start_failed(app: &AppHandle, tool_id: &str, error: &str) {
+    emit_log(
+        app,
+        &format!("{} 启动更新失败：{}", tool_name_for_log(tool_id), error),
+        "error",
+    );
+}
+
+fn emit_claude_script_fetch_start(app: &AppHandle) {
+    emit_log(app, "正在获取 Claude 安装脚本…", "info");
+}
+
+fn emit_claude_script_fetch_done(app: &AppHandle, elapsed: Duration) {
+    emit_log(
+        app,
+        &format!("官方安装脚本获取完成，耗时 {:.1}s", elapsed.as_secs_f32()),
+        "info",
+    );
+}
+
+fn emit_claude_script_execute_start(app: &AppHandle, detail: &str) {
+    emit_log(
+        app,
+        &format!("已验证安装脚本，开始执行（{}）。", detail),
+        "info",
+    );
+}
+
+fn emit_claude_script_execute_done(app: &AppHandle, elapsed: Duration) {
+    emit_log(
+        app,
+        &format!("安装脚本执行结束，耗时 {:.1}s", elapsed.as_secs_f32()),
+        "info",
     );
 }
 
@@ -1124,19 +1873,33 @@ async fn refresh_tool_state(app: &AppHandle, tool_id: &str, shell: &str) -> Opti
 
     let path = resolve_command_path(shell, bin).await;
     let (status, current_version, current_norm, path_value) = if let Some(path) = path {
-        if let Some((display, norm)) = get_tool_version(shell, bin).await {
-            ("installed".to_string(), display, norm, path)
-        } else {
-            ("installed".to_string(), "--".to_string(), None, path)
-        }
+        let path_buf = PathBuf::from(&path);
+        let (display, norm) = resolve_tool_version(shell, tool_id, &path_buf).await;
+        ("installed".to_string(), display, norm, path)
     } else if tool_id == "claude" {
-        if let Some(fallback) = claude_fallback_path() {
+        if platform == PlatformKind::Windows {
+            if let Some(fallback) = find_windows_claude_fallback(shell).await {
+                let (display, norm) = resolve_tool_version(shell, tool_id, &fallback).await;
+                path_needs_setup = windows_local_bin_needs_path_setup(shell).await;
+                (
+                    "installed".to_string(),
+                    display,
+                    norm,
+                    fallback.to_string_lossy().to_string(),
+                )
+            } else {
+                (
+                    "not_installed".to_string(),
+                    "--".to_string(),
+                    None,
+                    "--".to_string(),
+                )
+            }
+        } else if let Some(fallback) = claude_fallback_path() {
             if fs::metadata(&fallback).await.is_ok() {
-                let (display, norm) = match get_tool_version_at_path(shell, &fallback).await {
-                    Some((version, parsed)) => (version, parsed),
-                    None => ("--".to_string(), None),
-                };
-                path_needs_setup = tool_supports_path_fix && !shell_config_has_local_bin(&shell_config_file).await;
+                let (display, norm) = resolve_tool_version(shell, tool_id, &fallback).await;
+                path_needs_setup =
+                    tool_supports_path_fix && !shell_config_has_local_bin(&shell_config_file).await;
                 (
                     "installed".to_string(),
                     display,
@@ -1231,7 +1994,8 @@ async fn refresh_tool_latest_version(
 #[tauri::command]
 async fn refresh_latest_versions(app: AppHandle) -> Result<Vec<ToolState>, String> {
     let shell = preferred_shell();
-    let envs = build_proxy_envs(&current_settings(&app));
+    let proxy_context = resolve_proxy_context(&current_settings(&app));
+    let envs = proxy_context.envs;
     let tool_ids = {
         let state = app.state::<AppState>();
         let inner = state.inner.lock().map_err(|_| "锁失败".to_string())?;
@@ -1313,6 +2077,9 @@ async fn apply_path_fix(app: AppHandle, tool_id: String) -> Result<(), String> {
     if !supports_path_fix(&tool_id, platform) {
         return Err("当前平台不支持 PATH 修复。".to_string());
     }
+    if platform == PlatformKind::Windows {
+        return apply_windows_path_fix(app, tool_id).await;
+    }
     let config_path =
         shell_config_path(platform).ok_or_else(|| "无法识别 shell 配置文件。".to_string())?;
     let config_path_display = config_path.to_string_lossy().to_string();
@@ -1371,6 +2138,9 @@ async fn apply_path_cleanup(app: AppHandle, tool_id: String) -> Result<(), Strin
     if !supports_path_fix(&tool_id, platform) {
         return Err("当前平台不支持 PATH 清理。".to_string());
     }
+    if platform == PlatformKind::Windows {
+        return apply_windows_path_cleanup(app, tool_id).await;
+    }
     let config_path =
         shell_config_path(platform).ok_or_else(|| "无法识别 shell 配置文件。".to_string())?;
     let config_path_display = config_path.to_string_lossy().to_string();
@@ -1389,7 +2159,7 @@ async fn apply_path_cleanup(app: AppHandle, tool_id: String) -> Result<(), Strin
     };
 
     if !content.lines().any(|line| line.contains(PATH_MARKER)) {
-        emit_log(&app, "未检测到 DevHub 写入的 PATH 记录，无需清理。", "info");
+        emit_path_cleanup_noop(&app, "");
         return Ok(());
     }
 
@@ -1424,6 +2194,87 @@ async fn apply_path_cleanup(app: AppHandle, tool_id: String) -> Result<(), Strin
         "success",
     );
     if let Some(tool) = refresh_tool_state(&app, &tool_id, preferred_shell()).await {
+        emit_tool_updated(&app, &tool);
+    }
+    Ok(())
+}
+
+async fn apply_windows_path_fix(app: AppHandle, tool_id: String) -> Result<(), String> {
+    let shell = preferred_shell();
+    let target = windows_local_bin_path()
+        .ok_or_else(|| "无法解析用户目录。".to_string())?
+        .to_string_lossy()
+        .to_string();
+    let current = windows_user_path(shell).await.unwrap_or_default();
+    if current.trim().is_empty() {
+        emit_windows_path_read_failed(&app, "已中止写入", "error");
+        return Err("读取用户 PATH 失败".to_string());
+    }
+    if windows_path_contains(&current, &target) {
+        emit_log(&app, "已检测到用户 PATH 中存在 Claude 目录，无需重复写入。", "info");
+        if let Some(tool) = refresh_tool_state(&app, &tool_id, shell).await {
+            emit_tool_updated(&app, &tool);
+        }
+        return Ok(());
+    }
+
+    let mut segments = split_windows_path(&current);
+    segments.push(target.clone());
+    let next = segments.join(";");
+    set_windows_user_path(shell, &next)
+        .await
+        .map_err(|error| format!("写入用户 PATH 失败：{}", error))?;
+    if let Some(updated) = windows_user_path(shell).await {
+        if !windows_path_contains(&updated, &target) {
+            emit_log(
+                &app,
+                "已尝试写入用户 PATH，但未检测到目标目录，请检查权限或重试。",
+                "warn",
+            );
+        }
+    }
+    emit_log(
+        &app,
+        &format!("已写入用户 PATH：{}", target),
+        "success",
+    );
+    emit_log(&app, "请重启终端或 DevHub 以使 PATH 生效。", "success");
+    if let Some(tool) = refresh_tool_state(&app, &tool_id, shell).await {
+        emit_tool_updated(&app, &tool);
+    }
+    Ok(())
+}
+
+async fn apply_windows_path_cleanup(app: AppHandle, tool_id: String) -> Result<(), String> {
+    let shell = preferred_shell();
+    let target = windows_local_bin_path()
+        .ok_or_else(|| "无法解析用户目录。".to_string())?
+        .to_string_lossy()
+        .to_string();
+    let current = windows_user_path(shell).await.unwrap_or_default();
+    if current.is_empty() {
+        emit_windows_path_read_failed(&app, "无法清理", "warn");
+        return Err("读取用户 PATH 失败".to_string());
+    }
+    let mut removed = false;
+    let mut segments: Vec<String> = Vec::new();
+    for item in split_windows_path(&current) {
+        if windows_path_contains(&item, &target) {
+            removed = true;
+            continue;
+        }
+        segments.push(item);
+    }
+    if !removed {
+        emit_path_cleanup_noop(&app, "Claude ");
+        return Ok(());
+    }
+    let next = segments.join(";");
+    set_windows_user_path(shell, &next)
+        .await
+        .map_err(|error| format!("写入用户 PATH 失败：{}", error))?;
+    emit_log(&app, "已从用户 PATH 中移除 Claude 目录。", "success");
+    if let Some(tool) = refresh_tool_state(&app, &tool_id, shell).await {
         emit_tool_updated(&app, &tool);
     }
     Ok(())
@@ -1514,36 +2365,71 @@ async fn run_tool_action(
     let status = status_for_action(&action).ok_or_else(|| "未知操作".to_string())?;
     let command =
         command_for_action(&tool_id, &action, platform).ok_or_else(|| "未找到命令".to_string())?;
-    let proxy_envs = if matches!(action.as_str(), "install" | "update") {
-        build_proxy_envs(&current_settings(&app))
+    let proxy_context = if matches!(action.as_str(), "install" | "update") {
+        let settings = current_settings(&app);
+        emit_log(
+            &app,
+            &format!("代理设置快照：{}", proxy_settings_snapshot(&settings)),
+            "info",
+        );
+        resolve_proxy_context(&settings)
     } else {
-        Vec::new()
+        ProxyContext::none()
     };
+    let proxy_envs = proxy_context.envs;
+    let proxy_url = proxy_context.url.clone();
 
     if let Err(error) = check_action_dependencies(shell, &tool_id, &action, platform).await {
         rollback_tool_state(&app, &tool_id, rollback);
-        return Err(error);
+        return Err(format_action_error(&tool_id, &action, &error));
     }
 
-    if tool_id == "claude" && action == "install" && platform == PlatformKind::Unix {
-        if let Err(error) = run_claude_install(&app, &tool_id, status, shell, &proxy_envs).await {
-            rollback_tool_state(&app, &tool_id, rollback);
-            return Err(format!("命令失败：{}", error));
-        }
-        finalize_success(&app, &tool_id, &action, shell).await;
-        return Ok(());
+    let result = if tool_id == "claude" && action == "install" {
+        run_claude_install(
+            &app,
+            &tool_id,
+            status,
+            shell,
+            platform,
+            &proxy_envs,
+            proxy_url.clone(),
+            proxy_context.source,
+        )
+        .await
+    } else if tool_id == "claude" && action == "uninstall" && platform == PlatformKind::Windows {
+        run_claude_uninstall_windows(&app, &tool_id, status, shell, &proxy_envs).await
+    } else {
+        run_action_command(&app, &tool_id, status, shell, &command, &proxy_envs).await
+    };
+
+    finalize_action_result(&app, &tool_id, &action, shell, rollback, result).await
+}
+
+async fn run_action_command(
+    app: &AppHandle,
+    tool_id: &str,
+    status: &str,
+    shell: &str,
+    command: &str,
+    envs: &[(String, String)],
+) -> Result<(), String> {
+    emit_command_log_with_action(app, tool_id, status, command);
+    run_command_streaming(app, tool_id, status, shell, command, envs).await
+}
+
+async fn finalize_action_result(
+    app: &AppHandle,
+    tool_id: &str,
+    action: &str,
+    shell: &str,
+    rollback: ToolRollback,
+    result: Result<(), String>,
+) -> Result<(), String> {
+    if let Err(error) = result {
+        rollback_tool_state(app, tool_id, rollback);
+        return Err(format_action_error(tool_id, action, &error));
     }
-
-    emit_log(&app, &format!("执行命令：{}", command), "info");
-
-    if let Err(error) =
-        run_command_streaming(&app, &tool_id, status, shell, &command, &proxy_envs).await
-    {
-        rollback_tool_state(&app, &tool_id, rollback);
-        return Err(format!("命令失败：{}", error));
-    }
-
-    finalize_success(&app, &tool_id, &action, shell).await;
+    finalize_success(app, tool_id, action, shell).await;
     Ok(())
 }
 
@@ -1556,13 +2442,21 @@ async fn check_action_dependencies(
     if tool_id == "claude" {
         if action == "install" {
             if platform == PlatformKind::Windows {
-                ensure_dependency(shell, "powershell").await?;
+                let has_powershell = resolve_windows_powershell(shell).await.is_some();
+                let has_curl = resolve_command_path(shell, "curl").await.is_some();
+                if !has_powershell && !has_curl {
+                    return Err("缺少依赖：powershell/pwsh 或 curl（至少需要一个）".to_string());
+                }
             } else {
                 ensure_dependency(shell, "curl").await?;
                 ensure_dependency(shell, "bash").await?;
             }
         } else if action == "update" {
             ensure_dependency(shell, "claude").await?;
+        } else if action == "uninstall" && platform == PlatformKind::Windows {
+            if resolve_windows_powershell(shell).await.is_none() {
+                return Err("缺少依赖：powershell 或 pwsh".to_string());
+            }
         }
     }
 
@@ -1579,29 +2473,45 @@ async fn run_claude_install(
     tool_id: &str,
     status: &str,
     shell: &str,
+    platform: PlatformKind,
     envs: &[(String, String)],
+    proxy_url: Option<String>,
+    proxy_source: ProxySource,
 ) -> Result<(), String> {
-    emit_log(app, "正在获取 Claude 安装脚本…", "info");
-    let script =
-        read_command_output_with_env(shell, "curl -fsSL https://claude.ai/install.sh", envs)
-            .await
-            .map_err(|error| format!("无法获取官方安装脚本：{}", error))?;
+    if platform == PlatformKind::Windows {
+        return run_claude_install_windows(
+            app,
+            tool_id,
+            status,
+            shell,
+            envs,
+            proxy_url,
+            proxy_source,
+        )
+        .await;
+    }
+
+    let fetch_start = Instant::now();
+    emit_claude_script_fetch_start(app);
+    let script = read_command_output_with_env(
+        shell,
+        &format!("curl -fsSL {}", CLAUDE_INSTALL_SH_URL),
+        envs,
+    )
+    .await
+    .map_err(|error| {
+        let message = format!("无法获取官方安装脚本：{}", error);
+        emit_script_fetch_failed(app, tool_id, &message);
+        message
+    })?;
+    emit_claude_script_fetch_done(app, fetch_start.elapsed());
     let trimmed = script.trim_start();
     if trimmed.is_empty() {
         return Err("未获取到官方安装脚本，请检查网络连接。".to_string());
     }
 
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("<!doctype html") || lower.starts_with("<html") {
-        if lower.contains("app unavailable in region") {
-            return Err(
-                "官方安装脚本不可用：当前网络/地区无法访问（App unavailable in region）。"
-                    .to_string(),
-            );
-        }
-        return Err("官方安装脚本异常：返回了 HTML 页面。请检查网络或代理。".to_string());
-    }
-    if !trimmed.starts_with("#!") {
+    validate_claude_install_script(trimmed)?;
+    if !has_shell_shebang(trimmed) {
         return Err("官方安装脚本异常：返回内容不是可执行脚本。".to_string());
     }
 
@@ -1609,12 +2519,140 @@ async fn run_claude_install(
     fs::write(&temp_path, script)
         .await
         .map_err(|error| format!("写入安装脚本失败：{}", error))?;
-    emit_log(app, "已验证安装脚本，开始执行。", "info");
+    let exec_start = Instant::now();
+    emit_claude_script_execute_start(app, "bash");
 
     let command = format!("bash \"{}\"", temp_path.to_string_lossy());
     let result = run_command_streaming(app, tool_id, status, shell, &command, envs).await;
+    emit_claude_script_execute_done(app, exec_start.elapsed());
     let _ = fs::remove_file(&temp_path).await;
     result
+}
+
+async fn run_claude_install_windows(
+    app: &AppHandle,
+    tool_id: &str,
+    status: &str,
+    shell: &str,
+    envs: &[(String, String)],
+    proxy_url: Option<String>,
+    proxy_source: ProxySource,
+) -> Result<(), String> {
+    let powershell = resolve_windows_powershell(shell).await;
+    let mut errors: Vec<String> = Vec::new();
+    let proxy = proxy_url.or_else(|| proxy_url_from_envs(envs));
+    let source_label = proxy_source_label(proxy_source);
+
+    if let Some(info) = powershell.as_ref() {
+        let script = fetch_claude_install_script_windows(
+            app,
+            shell,
+            envs,
+            powershell.as_ref(),
+            proxy.as_deref(),
+            source_label,
+        )
+        .await?;
+        match execute_claude_powershell_install(
+            app, tool_id, status, shell, envs, info, &script,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(error),
+        }
+    } else {
+        errors.push("缺少依赖：powershell 或 pwsh".to_string());
+    }
+
+    Err(errors.join("；"))
+}
+
+async fn run_powershell_script_streaming(
+    app: &AppHandle,
+    tool_id: &str,
+    status: &str,
+    powershell: &PowerShellInfo,
+    script_path: &Path,
+    envs: &[(String, String)],
+) -> Result<(), String> {
+    emit_log(
+        app,
+        "Windows 运行 PowerShell 脚本改用直连通道，避免 cmd.exe 带来的额外延迟。",
+        "info",
+    );
+    let mut child = Command::new(&powershell.bin)
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(script_path)
+        .envs(envs.iter().cloned())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("启动命令失败：{}", error))?;
+    run_child_streaming(app, tool_id, status, &mut child).await
+}
+
+async fn execute_claude_powershell_install(
+    app: &AppHandle,
+    tool_id: &str,
+    status: &str,
+    shell: &str,
+    envs: &[(String, String)],
+    powershell: &PowerShellInfo,
+    script: &str,
+) -> Result<(), String> {
+    let exec_start = Instant::now();
+    let temp_path = std::env::temp_dir().join(format!("claude-install-{}.ps1", now_timestamp()));
+    write_utf8_bom(&temp_path, script).await?;
+    emit_tool_install_attempt(app, tool_id, "PowerShell 本地脚本", Some("（macOS 同款流程）"));
+    emit_command_log_with_action(
+        app,
+        tool_id,
+        status,
+        &format!("{} -File {}", powershell.bin, temp_path.to_string_lossy()),
+    );
+    emit_claude_script_execute_start(app, "PowerShell 本地脚本");
+
+    let result =
+        run_powershell_script_streaming(app, tool_id, status, powershell, &temp_path, envs).await;
+    emit_claude_script_execute_done(app, exec_start.elapsed());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = fs::remove_file(&temp_path).await;
+    match result {
+        Ok(()) => {
+            if windows_claude_detected(shell).await {
+                Ok(())
+            } else {
+                Err("PowerShell：安装完成但未检测到可执行文件".to_string())
+            }
+        }
+        Err(error) => Err(format!("PowerShell：{}", error)),
+    }
+}
+
+async fn run_claude_uninstall_windows(
+    app: &AppHandle,
+    tool_id: &str,
+    status: &str,
+    shell: &str,
+    envs: &[(String, String)],
+) -> Result<(), String> {
+    let powershell = resolve_windows_powershell(shell)
+        .await
+        .ok_or_else(|| "缺少依赖：powershell 或 pwsh".to_string())?;
+    let command = build_windows_claude_uninstall_encoded_command(&powershell);
+    emit_tool_uninstall_attempt(app, tool_id, "PowerShell 官方命令", None);
+    emit_log(
+        app,
+        &format!("卸载命令（官方原文）：{}", windows_claude_uninstall_script()),
+        "info",
+    );
+    emit_command_log_with_action(app, tool_id, status, "powershell -EncodedCommand <base64>");
+    run_command_streaming(app, tool_id, status, shell, &command, envs).await
 }
 
 async fn run_command_streaming(
@@ -1634,6 +2672,15 @@ async fn run_command_streaming(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("启动命令失败：{}", error))?;
+    run_child_streaming(app, tool_id, status, &mut child).await
+}
+
+async fn run_child_streaming(
+    app: &AppHandle,
+    tool_id: &str,
+    status: &str,
+    child: &mut tokio::process::Child,
+) -> Result<(), String> {
 
     let stdout = child
         .stdout
@@ -1644,47 +2691,109 @@ async fn run_command_streaming(
         .take()
         .ok_or_else(|| "无法读取错误输出".to_string())?;
 
-    let mut stdout_lines = BufReader::new(stdout).lines();
-    let mut stderr_lines = BufReader::new(stderr).lines();
+    let mut stdout_reader = BufReader::new(stdout);
+    let mut stderr_reader = BufReader::new(stderr);
+    let mut stdout_partial: Vec<u8> = Vec::new();
+    let mut stderr_partial: Vec<u8> = Vec::new();
+    let mut stdout_chunk = [0u8; 1024];
+    let mut stderr_chunk = [0u8; 1024];
     let mut progress: u8 = 10;
     update_tool_progress(app, tool_id, progress, status);
 
     let mut stdout_done = false;
     let mut stderr_done = false;
+    let mut last_output = Instant::now();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let drain_lines = |partial: &mut Vec<u8>, chunk: &[u8]| -> Vec<String> {
+        partial.extend_from_slice(chunk);
+        let mut lines: Vec<String> = Vec::new();
+        let mut start = 0usize;
+        let mut idx = 0usize;
+        while idx < partial.len() {
+            let byte = partial[idx];
+            if byte == b'\n' || byte == b'\r' {
+                if start < idx {
+                    let slice = &partial[start..idx];
+                    let text = strip_ansi(decode_output(slice).trim()).trim().to_string();
+                    if !text.is_empty() {
+                        lines.push(text);
+                    }
+                }
+                idx += 1;
+                start = idx;
+                continue;
+            }
+            idx += 1;
+        }
+        if start > 0 {
+            partial.drain(0..start);
+        }
+        lines
+    };
+
     while !(stdout_done && stderr_done) {
         tokio::select! {
-            line = stdout_lines.next_line(), if !stdout_done => {
-                match line {
-                    Ok(Some(content)) => {
-                        let line = strip_ansi(content.trim()).trim().to_string();
-                        if !line.is_empty() {
+            read = stdout_reader.read(&mut stdout_chunk), if !stdout_done => {
+                match read {
+                    Ok(0) => {
+                        stdout_done = true;
+                        let lines = drain_lines(&mut stdout_partial, &[]);
+                        for line in lines {
                             emit_log(app, &line, "info");
                             progress = progress.saturating_add(8).min(90);
                             update_tool_progress(app, tool_id, progress, status);
+                            last_output = Instant::now();
                         }
                     }
-                    Ok(None) => stdout_done = true,
+                    Ok(n) => {
+                        let lines = drain_lines(&mut stdout_partial, &stdout_chunk[..n]);
+                        for line in lines {
+                            emit_log(app, &line, "info");
+                            progress = progress.saturating_add(8).min(90);
+                            update_tool_progress(app, tool_id, progress, status);
+                            last_output = Instant::now();
+                        }
+                    }
                     Err(error) => {
                         emit_log(app, &format!("读取输出失败：{}", error), "warn");
                         stdout_done = true;
                     }
                 }
             }
-            line = stderr_lines.next_line(), if !stderr_done => {
-                match line {
-                    Ok(Some(content)) => {
-                        let line = strip_ansi(content.trim()).trim().to_string();
-                        if !line.is_empty() {
+            read = stderr_reader.read(&mut stderr_chunk), if !stderr_done => {
+                match read {
+                    Ok(0) => {
+                        stderr_done = true;
+                        let lines = drain_lines(&mut stderr_partial, &[]);
+                        for line in lines {
                             emit_log(app, &line, stderr_log_level(&line));
                             progress = progress.saturating_add(6).min(90);
                             update_tool_progress(app, tool_id, progress, status);
+                            last_output = Instant::now();
                         }
                     }
-                    Ok(None) => stderr_done = true,
+                    Ok(n) => {
+                        let lines = drain_lines(&mut stderr_partial, &stderr_chunk[..n]);
+                        for line in lines {
+                            emit_log(app, &line, stderr_log_level(&line));
+                            progress = progress.saturating_add(6).min(90);
+                            update_tool_progress(app, tool_id, progress, status);
+                            last_output = Instant::now();
+                        }
+                    }
                     Err(error) => {
                         emit_log(app, &format!("读取错误输出失败：{}", error), "warn");
                         stderr_done = true;
                     }
+                }
+            }
+            _ = heartbeat.tick() => {
+                if last_output.elapsed() >= Duration::from_secs(20) && progress < 90 {
+                    emit_log(app, "命令仍在执行，暂未输出日志，请稍候…", "info");
+                    progress = progress.saturating_add(2).min(90);
+                    update_tool_progress(app, tool_id, progress, status);
+                    last_output = Instant::now();
                 }
             }
         }
@@ -1722,9 +2831,62 @@ fn rollback_tool_state(app: &AppHandle, tool_id: &str, rollback: ToolRollback) {
 }
 
 async fn finalize_success(app: &AppHandle, tool_id: &str, action: &str, shell: &str) {
-    let snapshot = refresh_tool_state(app, tool_id, shell).await;
-    if let Some(tool) = snapshot {
+    let mut snapshot = refresh_tool_state(app, tool_id, shell).await;
+    if action == "install" && tool_id == "claude" && current_platform() == PlatformKind::Windows {
+        if snapshot.as_ref().map(|tool| tool.status.as_str()) == Some("not_installed") {
+            for _ in 0..3 {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                snapshot = refresh_tool_state(app, tool_id, shell).await;
+                if snapshot.as_ref().map(|tool| tool.status.as_str()) != Some("not_installed") {
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(tool) = snapshot.clone() {
         emit_tool_updated(app, &tool);
+    }
+
+    if action == "install" {
+        if let Some(ref tool) = snapshot {
+            if tool.status == "not_installed" {
+                if tool_id == "claude" && current_platform() == PlatformKind::Windows {
+                    let details = claude_windows_debug_paths(shell).await.join(" | ");
+                    if !details.is_empty() {
+                        emit_log(
+                            app,
+                            &format!("Claude Windows 路径检查：{}", details),
+                            "warn",
+                        );
+                    }
+                }
+                let message = format!(
+                    "{} 安装完成但未检测到可执行文件，请检查安装日志或重试。",
+                    tool_name_for_log(tool_id)
+                );
+                emit_log(app, &message, "error");
+                emit_action_result(app, tool_id, action, false, &message);
+                return;
+            }
+        }
+    }
+
+    if action == "install"
+        && tool_id == "claude"
+        && current_platform() == PlatformKind::Windows
+        && snapshot
+            .as_ref()
+            .is_some_and(|tool| tool.supports_path_fix && tool.path_needs_setup)
+    {
+        emit_log(app, "检测到 Claude PATH 未配置，开始自动写入用户 PATH…", "info");
+        if let Err(error) = apply_windows_path_fix(app.clone(), tool_id.to_string()).await {
+            emit_log(
+                app,
+                &format!("自动写入用户 PATH 失败：{}", error),
+                "warn",
+            );
+        }
     }
 
     let message = format!(
@@ -1742,6 +2904,15 @@ fn tool_name_for_log(tool_id: &str) -> String {
         .unwrap_or_else(|| tool_id.to_string())
 }
 
+fn format_action_error(tool_id: &str, action: &str, error: &str) -> String {
+    format!(
+        "{} {}失败：{}",
+        tool_name_for_log(tool_id),
+        action_label(action),
+        error
+    )
+}
+
 #[tauri::command]
 fn batch_update(window: Window, state: State<AppState>) -> Result<BatchUpdateResult, String> {
     let app = window.app_handle();
@@ -1756,7 +2927,7 @@ fn batch_update(window: Window, state: State<AppState>) -> Result<BatchUpdateRes
     };
 
     if tool_ids.is_empty() {
-        emit_log(&app, "暂无可更新的工具", "warn");
+        emit_batch_update_empty(&app);
         return Ok(BatchUpdateResult {
             started: Vec::new(),
             failed: Vec::new(),
@@ -1769,11 +2940,7 @@ fn batch_update(window: Window, state: State<AppState>) -> Result<BatchUpdateRes
         if let Err(error) =
             start_action_inner(app.clone(), state.clone(), tool_id.clone(), "update".into())
         {
-            emit_log(
-                &app,
-                &format!("{} 启动更新失败：{}", tool_name_for_log(&tool_id), error),
-                "error",
-            );
+            emit_update_start_failed(&app, &tool_id, &error);
             failed.push(BatchUpdateFailure {
                 tool_id,
                 reason: error,
@@ -1849,10 +3016,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_action_command_should_use_npm_for_claude_windows_uninstall() {
+    fn resolve_action_command_should_use_powershell_for_claude_windows_uninstall() {
         let windows_uninstall =
             resolve_action_command("claude", "uninstall", super::PlatformKind::Windows);
-        assert_eq!(windows_uninstall, "npm uninstall -g @anthropic-ai/claude-code");
+        assert!(windows_uninstall.contains("Remove-Item -Path"));
     }
 
     #[test]

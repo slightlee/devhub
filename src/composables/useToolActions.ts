@@ -5,8 +5,14 @@ import { useToolEventSubscriptions } from "./tool-actions/useToolEventSubscripti
 import { useToolSourceAndRefresh } from "./tool-actions/useToolSourceAndRefresh";
 import { useToolStateMachine } from "./tool-actions/useToolStateMachine";
 import type { AddLog, OnActionFailure } from "./tool-actions/types";
+import type { SettingsState } from "../types/models";
+import type { Ref } from "vue";
 
-export const useToolActions = (addLog: AddLog, onActionFailure: OnActionFailure) => {
+export const useToolActions = (
+  addLog: AddLog,
+  onActionFailure: OnActionFailure,
+  settings?: Ref<SettingsState>,
+) => {
   const {
     clearPendingPathState,
     closePath,
@@ -59,6 +65,7 @@ export const useToolActions = (addLog: AddLog, onActionFailure: OnActionFailure)
     optionChecked,
     pendingAction,
     resetConfirmState,
+    settings,
     tools,
   });
 
