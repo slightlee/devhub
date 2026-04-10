@@ -29,7 +29,7 @@ export const useToolStateMachine = ({ addLog }: Params) => {
   });
 
   const maybeRunPostActions = (prev: Tool | null, next: Tool) => {
-    if (next.id === "claude") {
+    if (next.id === "claude" && next.supportsPathFix) {
       if (pendingPathFix.has(next.id) && prev?.status === "installing") {
         if (["installed", "update_available"].includes(next.status)) {
           pendingPathFix.delete(next.id);

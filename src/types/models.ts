@@ -23,6 +23,7 @@ export interface Tool {
   path: string;
   configPath: string;
   pathNeedsSetup: boolean;
+  supportsPathFix: boolean;
   shellConfigFile: string;
   progress: number;
   activeAction?: ActionType;

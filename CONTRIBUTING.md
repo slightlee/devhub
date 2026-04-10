@@ -6,6 +6,11 @@
 
 当前主验证平台为 macOS，Windows/Linux 功能正在开发中。
 
+### 环境说明
+
+- 运行桌面端开发命令前，请先满足对应系统依赖
+- Windows 常见环境报错与排查见 `docs/FAQ.md`
+
 ```bash
 pnpm install
 pnpm tauri dev

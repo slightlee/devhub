@@ -1,10 +1,16 @@
 // useCliHubState 工具函数测试：校验模块判定与日志通道映射语义。
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   isModuleKey,
   logStatusChannel,
+  resolveOsName,
   shouldSurfaceLogStatus,
 } from "../src/composables/useCliHubState";
+
+vi.mock("@tauri-apps/plugin-os", () => ({
+  type: vi.fn(() => "windows"),
+  version: vi.fn(() => "10.0.22631"),
+}));
 
 describe("useCliHubState", () => {
   it("应识别合法模块名并拒绝非法值", () => {
@@ -29,5 +35,9 @@ describe("useCliHubState", () => {
     expect(logStatusChannel("error")).toBe("error");
     expect(logStatusChannel("info")).toBeNull();
     expect(logStatusChannel("success")).toBeNull();
+  });
+
+  it("Windows 内核版本为 10.0.22000+ 时应展示为 Windows 11", () => {
+    expect(resolveOsName()).toBe("Windows 11 (10.0.22631)");
   });
 });
